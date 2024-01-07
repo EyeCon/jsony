@@ -4,7 +4,7 @@
 
 ![Github Actions](https://github.com/treeform/jsony/workflows/Github%20Actions/badge.svg)
 
-[API reference](https://nimdocs.com/treeform/jsony)
+[API reference](https://treeform.github.io/jsony)
 
 This library has no dependencies other than the Nim standard library.
 
@@ -250,6 +250,33 @@ Gives us:
 "10/13"
 ```
 
+### `proc skipHook*()` Can be used to skip fields when serializing an object
+
+If you want to skip some fields when serializing an object you can declare a `skipHook*()`
+
+```nim
+type
+  Conn = object
+    id: int
+  Foo = object
+    a: int
+    password: string
+    b: float
+    conn: Conn
+
+proc skipHook*(T: typedesc[Foo], key: static string): bool =
+  key in ["password", "conn"]
+
+var v = Foo(a:1, password: "12345", b:0.5, conn: Conn(id: 1))
+let s = v.toJson()
+```
+
+Gives us:
+
+```
+"{"a":1,"b":0.5}"
+```
+
 ## Static writing with `toStaticJson`.
 
 Sometimes you have some json, and you want to write it in a static way. There is a special function for that:
@@ -297,4 +324,32 @@ type Entry = object
     "null":null
   }
 }""".fromJson(Entry)
+```
+
+## Full support for raw-json.
+
+Sometimes you don't need to parse the json, but just send it or store it in the database. You can speed this up by using `RawJson` type. What it does is prevents full parsing of that json tree and instead returns it is a `RawJson` (`distinct string`) type. You can then do anything you want with that. Store it in a database or pass it along to some other API. Or maybe parse it later again with jsony.
+
+```nim
+import jsony
+type
+  Message = object
+    id: uint64
+    data: RawJson
+
+let
+  messageData = """{"id":123,"data":{"page":"base64","arr":[1,2,3]}}"""
+  message = messageData.fromJson(Message)
+
+# make sure raw json was not parsed
+doAssert message.data.string == """{"page":"base64","arr":[1,2,3]}"""
+
+# make sure that dumping raw json produces same result
+doAssert message.toJson() == messageData
+```
+
+You can also wait to parse the json later or maybe even with different types:
+
+```
+message.data.string.fromJson(DataPayload)
 ```

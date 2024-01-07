@@ -1,8 +1,11 @@
-import jsony/objvar, strutils, tables, sets, unicode, json, options, parseutils, typetraits
+import jsony/objvar, std/json, std/options, std/parseutils, std/sets,
+    std/strutils, std/tables, std/typetraits, std/unicode
 
 type JsonError* = object of ValueError
 
-const whiteSpace = {' ', '\n', '\t', '\r'}
+const
+  whiteSpace = {' ', '\n', '\t', '\r'}
+  hex = "0123456789abcdef"
 
 when defined(release):
   {.push checks: off, inline.}
@@ -10,6 +13,7 @@ when defined(release):
 type
   SomeTable*[K, V] = Table[K, V] | OrderedTable[K, V] |
     TableRef[K, V] | OrderedTableRef[K, V]
+  RawJson* = distinct string
 
 proc parseHook*[T](s: string, i: var int, v: var seq[T])
 proc parseHook*[T: enum](s: string, i: var int, v: var T)
@@ -73,10 +77,19 @@ proc parseHook*(s: string, i: var int, v: var bool) =
   else:
     # Its faster to do char by char scan:
     eatSpace(s, i)
-    if i + 3 < s.len and s[i+0] == 't' and s[i+1] == 'r' and s[i+2] == 'u' and s[i+3] == 'e':
+    if i + 3 < s.len and
+        s[i+0] == 't' and
+        s[i+1] == 'r' and
+        s[i+2] == 'u' and
+        s[i+3] == 'e':
       i += 4
       v = true
-    elif i + 4 < s.len and s[i+0] == 'f' and s[i+1] == 'a' and s[i+2] == 'l' and s[i+3] == 's' and s[i+4] == 'e':
+    elif i + 4 < s.len and
+        s[i+0] == 'f' and
+        s[i+1] == 'a' and
+        s[i+2] == 'l' and
+        s[i+3] == 's' and
+        s[i+4] == 'e':
       i += 5
       v = false
     else:
@@ -129,8 +142,50 @@ proc parseHook*(s: string, i: var int, v: var SomeFloat) =
   i += chars
   v = f
 
+proc validRuneAt(s: string, i: int): Option[Rune] =
+  # Based on fastRuneAt from std/unicode
+
+  template ones(n: untyped): untyped = ((1 shl n)-1)
+
+  if uint(s[i]) <= 127:
+    result = some(Rune(uint(s[i])))
+  elif uint(s[i]) shr 5 == 0b110:
+    if i <= s.len - 2:
+      let valid = (uint(s[i+1]) shr 6 == 0b10)
+      if valid:
+        result = some(Rune(
+          (uint(s[i]) and (ones(5))) shl 6 or
+          (uint(s[i+1]) and ones(6))
+        ))
+  elif uint(s[i]) shr 4 == 0b1110:
+    if i <= s.len - 3:
+      let valid =
+        (uint(s[i+1]) shr 6 == 0b10) and
+        (uint(s[i+2]) shr 6 == 0b10)
+      if valid:
+        result = some(Rune(
+          (uint(s[i]) and ones(4)) shl 12 or
+          (uint(s[i+1]) and ones(6)) shl 6 or
+          (uint(s[i+2]) and ones(6))
+        ))
+  elif uint(s[i]) shr 3 == 0b11110:
+    if i <= s.len - 4:
+      let valid =
+        (uint(s[i+1]) shr 6 == 0b10) and
+        (uint(s[i+2]) shr 6 == 0b10) and
+        (uint(s[i+3]) shr 6 == 0b10)
+      if valid:
+        result = some(Rune(
+          (uint(s[i]) and ones(3)) shl 18 or
+          (uint(s[i+1]) and ones(6)) shl 12 or
+          (uint(s[i+2]) and ones(6)) shl 6 or
+          (uint(s[i+3]) and ones(6))
+        ))
+
 proc parseUnicodeEscape(s: string, i: var int): int =
   inc i
+  if i + 4 > s.len:
+    error("Expected unicode escape hex but end reached.", i)
   result = parseHexInt(s[i ..< i + 4])
   i += 3
   # Deal with UTF-16 surrogates. Most of the time strings are encoded as utf8
@@ -149,103 +204,75 @@ proc parseUnicodeEscape(s: string, i: var int): int =
     if (nextRune and 0xfc00) == 0xdc00:
       result = 0x10000 + (((result - 0xd800) shl 10) or (nextRune - 0xdc00))
 
-proc parseStringSlow(s: string, i: var int, v: var string) =
-  while i < s.len:
-    let c = s[i]
-    case c
-    of '"':
-      break
-    of '\\':
-      inc i
-      let c = s[i]
-      case c
-      of '"', '\\', '/': v.add(c)
-      of 'b': v.add '\b'
-      of 'f': v.add '\f'
-      of 'n': v.add '\n'
-      of 'r': v.add '\r'
-      of 't': v.add '\t'
-      of 'u':
-        v.add(Rune(parseUnicodeEscape(s, i)).toUTF8())
-      else:
-        v.add(c)
-    else:
-      v.add(c)
-    inc i
+proc parseHook*(s: string, i: var int, v: var string) =
+  ## Parse string.
+  eatSpace(s, i)
+  if i + 3 < s.len and
+      s[i+0] == 'n' and
+      s[i+1] == 'u' and
+      s[i+2] == 'l' and
+      s[i+3] == 'l':
+    i += 4
+    return
+
   eatChar(s, i, '"')
 
-proc parseStringFast(s: string, i: var int, v: var string) =
-  # It appears to be faster to scan the string once, then allocate exact chars,
-  # and then scan the string again populating it.
-  var
-    j = i
-    ll = 0
-  while j < s.len:
-    let c = s[j]
-    case c
-    of '"':
-      break
-    of '\\':
-      inc j
-      let c = s[j]
-      case c
-      of 'u':
-        ll += Rune(parseUnicodeEscape(s, j)).toUTF8().len
+  template doCopy() =
+    if i > copyStart:
+      let numBytes = i - copyStart
+      when nimvm:
+        for p in 0 ..< numBytes:
+          v.add s[copyStart + p]
       else:
-        inc ll
-    else:
-      inc ll
-    inc j
+        when defined(js):
+          for p in 0 ..< numBytes:
+            v.add s[copyStart + p]
+        else:
+          let vLen = v.len
+          v.setLen(vLen + numBytes)
+          copyMem(v[vLen].addr, s[copyStart].unsafeAddr, numBytes)
+      copyStart = i
 
-  if ll > 0:
-    v = newString(ll)
-    var
-      at = 0
-      ss = cast[ptr UncheckedArray[char]](v[0].addr)
-    template add(ss: ptr UncheckedArray[char], c: char) =
-      ss[at] = c
-      inc at
-    while i < s.len:
-      let c = s[i]
+  var copyStart = i
+  while i < s.len:
+    let c = s[i]
+    if (cast[uint8](c) and 0b10000000) == 0:
+      # When the high bit is not set this is a single-byte character (ASCII)
       case c
       of '"':
         break
       of '\\':
+        if i + 1 >= s.len:
+          error("Expected escaped character but end reached.", i)
+        doCopy()
         inc i
+        copyStart = i
         let c = s[i]
         case c
-        of '"', '\\', '/': ss.add(c)
-        of 'b': ss.add '\b'
-        of 'f': ss.add '\f'
-        of 'n': ss.add '\n'
-        of 'r': ss.add '\r'
-        of 't': ss.add '\t'
+        of '"', '\\', '/': v.add(c)
+        of 'b': v.add '\b'
+        of 'f': v.add '\f'
+        of 'n': v.add '\n'
+        of 'r': v.add '\r'
+        of 't': v.add '\t'
         of 'u':
-          for c in Rune(parseUnicodeEscape(s, i)).toUTF8():
-            ss.add(c)
+          v.add(Rune(parseUnicodeEscape(s, i)))
         else:
-          ss.add(c)
+          v.add(c)
+        inc i
+        copyStart = i
       else:
-        ss.add(c)
-      inc i
+        inc i
+    else: # Multi-byte characters
+      let r = s.validRuneAt(i)
+      if r.isSome:
+        i += r.unsafeGet.size
+      else: # Not a valid rune
+        error("Found invalid UTF-8 character.", i)
+
+  doCopy()
 
   eatChar(s, i, '"')
-
-proc parseHook*(s: string, i: var int, v: var string) =
-  ## Parse string.
-  eatSpace(s, i)
-  if i + 3 < s.len and s[i+0] == 'n' and s[i+1] == 'u' and s[i+2] == 'l' and s[i+3] == 'l':
-    i += 4
-    return
-  eatChar(s, i, '"')
-
-  when nimvm:
-    parseStringSlow(s, i, v)
-  else:
-    when defined(js):
-      parseStringSlow(s, i, v)
-    else:
-      parseStringFast(s, i, v)
 
 proc parseHook*(s: string, i: var int, v: var char) =
   var str: string
@@ -284,7 +311,11 @@ proc parseHook*[T: array](s: string, i: var int, v: var T) =
 
 proc parseHook*[T: not object](s: string, i: var int, v: var ref T) =
   eatSpace(s, i)
-  if i + 3 < s.len and s[i+0] == 'n' and s[i+1] == 'u' and s[i+2] == 'l' and s[i+3] == 'l':
+  if i + 3 < s.len and
+      s[i+0] == 'n' and
+      s[i+1] == 'u' and
+      s[i+2] == 'l' and
+      s[i+3] == 'l':
     i += 4
     return
   new(v)
@@ -406,7 +437,11 @@ proc parseHook*[T: enum](s: string, i: var int, v: var T) =
 proc parseHook*[T: object|ref object](s: string, i: var int, v: var T) =
   ## Parse an object or ref object.
   eatSpace(s, i)
-  if i + 3 < s.len and s[i+0] == 'n' and s[i+1] == 'u' and s[i+2] == 'l' and s[i+3] == 'l':
+  if i + 3 < s.len and
+      s[i+0] == 'n' and
+      s[i+1] == 'u' and
+      s[i+2] == 'l' and
+      s[i+3] == 'l':
     i += 4
     return
   eatChar(s, i, '{')
@@ -448,7 +483,11 @@ proc parseHook*[T: object|ref object](s: string, i: var int, v: var T) =
 proc parseHook*[T](s: string, i: var int, v: var Option[T]) =
   ## Parse an Option.
   eatSpace(s, i)
-  if i + 3 < s.len and s[i+0] == 'n' and s[i+1] == 'u' and s[i+2] == 'l' and s[i+3] == 'l':
+  if i + 3 < s.len and
+      s[i+0] == 'n' and
+      s[i+1] == 'u' and
+      s[i+2] == 'l' and
+      s[i+3] == 'l':
     i += 4
     return
   var e: T
@@ -561,11 +600,17 @@ proc fromJson*[T](s: string, x: typedesc[T]): T =
   ## * `proc newHook(foo: var ...)` Can be used to populate default values.
   var i = 0
   s.parseHook(i, result)
+  eatSpace(s, i)
+  if i != s.len:
+    error("Found non-whitespace character after JSON data.", i)
 
 proc fromJson*(s: string): JsonNode =
   ## Takes json parses it into `JsonNode`s.
   var i = 0
   s.parseHook(i, result)
+  eatSpace(s, i)
+  if i != s.len:
+    error("Found non-whitespace character after JSON data.", i)
 
 proc dumpHook*(s: var string, v: bool)
 proc dumpHook*(s: var string, v: uint|uint8|uint16|uint32|uint64)
@@ -575,7 +620,7 @@ proc dumpHook*(s: var string, v: string)
 proc dumpHook*(s: var string, v: char)
 proc dumpHook*(s: var string, v: tuple)
 proc dumpHook*(s: var string, v: enum)
-type t[T] = tuple[a:string, b:T]
+type t[T] = tuple[a: string, b: T]
 proc dumpHook*[N, T](s: var string, v: array[N, t[T]])
 proc dumpHook*[N, T](s: var string, v: array[N, T])
 proc dumpHook*[T](s: var string, v: seq[T])
@@ -652,61 +697,65 @@ proc dumpHook*(s: var string, v: int|int8|int16|int32|int64) =
 proc dumpHook*(s: var string, v: SomeFloat) =
   s.add $v
 
-proc dumpStrSlow(s: var string, v: string) =
-  s.add '"'
-  for c in v:
-    case c:
-    of '\\': s.add r"\\"
-    of '\b': s.add r"\b"
-    of '\f': s.add r"\f"
-    of '\n': s.add r"\n"
-    of '\r': s.add r"\r"
-    of '\t': s.add r"\t"
-    of '"': s.add r"\"""
-    else:
-      s.add c
-  s.add '"'
-
-proc dumpStrFast(s: var string, v: string) =
-  # Its faster to grow the string only once.
-  # Then fill the string with pointers.
-  # Then cap it off to right length.
-  var at = s.len
-  s.setLen(s.len + v.len*2+2)
-
-  var ss = cast[ptr UncheckedArray[char]](s[0].addr)
-  template add(ss: ptr UncheckedArray[char], c: char) =
-    ss[at] = c
-    inc at
-  template add(ss: ptr UncheckedArray[char], c1, c2: char) =
-    ss[at] = c1
-    inc at
-    ss[at] = c2
-    inc at
-
-  ss.add '"'
-  for c in v:
-    case c:
-    of '\\': ss.add '\\', '\\'
-    of '\b': ss.add '\\', 'b'
-    of '\f': ss.add '\\', 'f'
-    of '\n': ss.add '\\', 'n'
-    of '\r': ss.add '\\', 'r'
-    of '\t': ss.add '\\', 't'
-    of '"': ss.add '\\', '"'
-    else:
-      ss.add c
-  ss.add '"'
-  s.setLen(at)
-
 proc dumpHook*(s: var string, v: string) =
-  when nimvm:
-    s.dumpStrSlow(v)
-  else:
-    when defined(js):
-      s.dumpStrSlow(v)
-    else:
-      s.dumpStrFast(v)
+  s.add '"'
+
+  template doCopy() =
+    if i > copyStart:
+      let numBytes = i - copyStart
+      when nimvm:
+        for p in 0 ..< numBytes:
+          s.add v[copyStart + p]
+      else:
+        when defined(js):
+          for p in 0 ..< numBytes:
+            s.add v[copyStart + p]
+        else:
+          let sLen = s.len
+          s.setLen(sLen + numBytes)
+          copyMem(s[sLen].addr, v[copyStart].unsafeAddr, numBytes)
+      copyStart = i
+
+  var i, copyStart: int
+  while i < v.len:
+    let c = v[i]
+    if (cast[uint8](c) and 0b10000000) == 0:
+      # When the high bit is not set this is a single-byte character (ASCII)
+      # Does this character need escaping?
+      if c < 32.char or c == '\\' or c == '"':
+        doCopy()
+        case c:
+        of '\\': s.add r"\\"
+        of '\b': s.add r"\b"
+        of '\f': s.add r"\f"
+        of '\n': s.add r"\n"
+        of '\r': s.add r"\r"
+        of '\t': s.add r"\t"
+        of '\v': s.add r"\u000b"
+        of '"': s.add r"\"""
+        of '\0'..'\7', '\14'..'\31':
+          s.add r"\u00"
+          s.add hex[c.int shr 4]
+          s.add hex[c.int and 0xf]
+        else:
+          discard # Not possible
+        inc i
+        copyStart = i
+      else:
+        inc i
+    else: # Multi-byte characters
+      let r = v.validRuneAt(i)
+      if r.isSome:
+        i += r.unsafeGet.size
+      else: # Not a valid rune, use replacement character
+        doCopy()
+        s.add Rune(0xfffd)
+        inc i
+        copyStart = i
+
+  doCopy()
+
+  s.add '"'
 
 template dumpKey(s: var string, v: string) =
   const v2 = v.toJson() & ":"
@@ -769,11 +818,21 @@ proc dumpHook*(s: var string, v: object) =
   else:
     # Normal objects.
     for k, e in v.fieldPairs:
-      if i > 0:
-        s.add ','
-      s.dumpKey(k)
-      s.dumpHook(e)
-      inc i
+      when compiles(skipHook(type(v), k)):
+        when skipHook(type(v), k):
+          discard
+        else:
+          if i > 0:
+            s.add ','
+          s.dumpKey(k)
+          s.dumpHook(e)
+          inc i
+      else:
+        if i > 0:
+          s.add ','
+        s.dumpKey(k)
+        s.dumpHook(e)
+        inc i
   s.add '}'
 
 proc dumpHook*[N, T](s: var string, v: array[N, t[T]]) =
@@ -842,6 +901,14 @@ proc dumpHook*(s: var string, v: JsonNode) =
     of JBool:
       s.dumpHook(v.getBool)
 
+proc parseHook*(s: string, i: var int, v: var RawJson) =
+  let oldI = i
+  skipValue(s, i)
+  v = s[oldI ..< i].RawJson
+
+proc dumpHook*(s: var string, v: RawJson) =
+  s.add v.string
+
 proc toJson*[T](v: T): string =
   dumpHook(result, v)
 
@@ -859,7 +926,6 @@ template toStaticJson*(v: untyped): static[string] =
 #   ## This will turn v into json at compile time and return the json string.
 #   const s = v.toJsonDynamic()
 #   s
-
 
 when defined(release):
   {.pop.}
